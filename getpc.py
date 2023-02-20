@@ -1,12 +1,11 @@
-'''
-Issues:
-    1. Cannot find OS version/name properly, inserts IP instead.
-
-'''
-
+# Networking
 import socket
+import nmap
+
+# Threading
 import threading
 import queue
+
 
 # Passing arguments
 import sys, getopt
@@ -15,6 +14,13 @@ import re
 def debug(message):
     if debugBool:
         print("debug | " + str(message))
+
+def debugException(e):
+    debug(type(e))
+    debug(e.args)
+    debug(e)
+    debug("")
+    sys.exit(2)
 
 responsive_ips = []
 
@@ -65,8 +71,6 @@ def worker(q):
 
 # Working
 def get_device_info(ip):
-    this_list = []
-    this_list.append(ip)
     # Retrieve device name, OS version, and open ports for the specified IP
     try:
         # Use the socket library to connect to the IP address and retrieve information
@@ -74,35 +78,63 @@ def get_device_info(ip):
         device_name = socket.gethostbyaddr(ip)[0]
         debug("Got device name for " + str(ip) + ": " + device_name)
     except socket.herror:
-        device_name = "No device name found"
-    this_list.append(device_name)
+        device_name = None
 
+    nm = nmap.PortScanner()
+    nm.scan(ip, arguments="-O")
+    nmap_result = nm[ip]
+
+    # Get uptime information
     try:
-        os_version = socket.gethostbyaddr(ip)[2][0]
-        debug("Got os_version for " + str(ip) + ": " + os_version)
-    except socket.herror:
-        os_version = "No OS version found"
-    this_list.append(os_version)
+        uptime = [nmap_result['uptime']['lastboot'], int(nmap_result['uptime']['seconds'])]
+    except KeyError:
+        uptime = [None, None]
+    except Exception as e:
+        debugException(e)
 
-    open_ports = []
-    for port in range(1, 1025):
-        debug("Scanning port: " + str(port))
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.1)
-            if s.connect_ex((ip, port)) == 0:
-                open_ports.append(port)
-                debug("Port: " + str(port) + " is open for " + str(ip))
-            s.close()
-        except Exception as e:
-            print(type(e))
-            print(e.args)
-            print(e)
-            print()
-    this_list.append(open_ports)
-    debug("Got open_ports for " + str(ip) + ": " + str(open_ports))
+    # Get open TCP ports
+    try:
+        tcp_ports = [port for port, port_data in nmap_result['tcp'].items() if port_data['state'] == 'open']
+    except Exception as e:
+        tcp_ports = None
+        debugException(e)
 
-    devices.append(this_list) # [ip, device_name, os_version, open_ports]
+    # Get port usage information
+    portused = {}
+    try:
+        for port_data in nmap_result['portused']:
+            portused[int(port_data['portid'])] = port_data['state']
+    except Exception as e:
+        portused = None
+        debugException(e)
+
+    # Get operating system names
+    try:
+        os_names = [os_match['name'] for os_match in nmap_result['osmatch']]
+        if not os_names:
+            os_names = None
+        if len(os_names) == 1:
+            os_names = os_names[0]
+    except Exception as e:
+        os_names = None
+        debugException(e)
+
+    devices.append({
+        "name": device_name,
+        "ip": ip,
+        "uptime": uptime,
+        "tcp": tcp_ports,
+        "portused": portused,
+        "os": os_names
+    })
+    debug({
+        "name": device_name,
+        "ip": ip,
+        "uptime": uptime,
+        "tcp": tcp_ports,
+        "portused": portused,
+        "os": os_names
+    })
 
 # Threading
 def get_infos():
@@ -136,6 +168,42 @@ def device_worker(qu):
         print("Getting info for: " + str(ip))
         get_device_info(ip)
 
+def output_device_info(listofdevices):
+    _output = ""
+    for device in listofdevices:
+        devicename = device['name'] if device['name'] else None
+        _output += f"Device name: {devicename}\n"
+
+        ip = device['ip'] if device['ip'] else None
+        _output += f"IP: {ip}\n"
+
+        os = device['os'] if device['os'] else None
+        if isinstance(device['os'], list):
+            os = " | ".join(os)
+        _output += f"OS: {os}\n"
+
+        if device['tcp']:
+            tcp_ports = ", ".join(str(port) for port in device['tcp'])
+        else:
+            tcp_ports = None
+        _output += f"Open TCP ports: {tcp_ports}\n"
+
+        if device['portused']:
+            port_used = ", ".join(f"{port} ({device['portused'][port].upper()})" for port in device['portused'])
+        else:
+            port_used = None
+        _output += f"Currently used ports: {port_used}\n"
+
+        if device['uptime'][1]:
+            uptime_seconds = device['uptime'][1]
+            uptime = f"{uptime_seconds // 86400} d {uptime_seconds // 3600 % 24} h {uptime_seconds // 60 % 60} min {uptime_seconds % 60} s ({uptime_seconds}s) since {device['uptime'][0]}"
+        else:
+            uptime = None
+        _output += f"Uptime: {uptime}\n\n"
+
+    return _output
+
+
 def main(argv):
     # Default arguments
     global network 
@@ -155,7 +223,7 @@ def main(argv):
         sys.exit(2)
     for opt, arg in opts:
         if opt == '-h':
-            print("This program allows you to scan and identify a network using the Python library: Socket.")
+            print("This program allows you to scan and identify devices within a network using the Python libraries: nmap and socket.")
             print("All parameters are optional.", end="\n\n")
             print("Parameters:")
             print("[-i <x.x.x.>] The x's are numbers with amount of digits 1-3. The format must be followed exactly. If argument is ignored, the input will default to '192.168.1.'.")
@@ -167,11 +235,14 @@ def main(argv):
             pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.$'
             if re.match(pattern, arg.strip()):
                 network = arg.strip()
+            else:
+                print("Wrong '-i' argument format. Use <x.x.x.>")
+                sys.exit(2)
         elif opt == '-d':
             debugBool = True
         elif opt == "-o":
             if arg.strip():
-                outputfile = arg
+                outputfile = arg.strip()
             else:
                 print('No output file specified. Usage: getpcsV2.py [-d] [-o <output_file>]')
                 sys.exit(2)
@@ -184,13 +255,7 @@ def main(argv):
     if outputfile:
         f = open(outputfile, "a")
 
-    output = ""
-    for device in devices:
-        if device:
-            output += "IP: " + str(device[0]) + "\n"
-            output += "Device name: " + str(device[1]) + "\n"
-            output += "OS version: " + str(device[2]) + "\n"
-            output += "Open ports: " + str(device[3]) + "\n\n"
+    output = output_device_info(devices)
 
     print(output)
 
